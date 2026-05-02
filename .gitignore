@@ -1,0 +1,39 @@
+# Build artifacts
+dist/
+build/
+*.egg-info/
+output/
+
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+coverage.json
+htmlcov/
+results.json
+*.json-report
+
+# mypy cache
+.mypy_cache/
+
+# ruff cache
+.ruff_cache/
+
+# Editor artifacts
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Database files
+*.db
+*.kuzu/
+code-graph.db/

@@ -1,0 +1,70 @@
+[project]
+name = "pydicom-xml"
+version = "0.1.0"
+description = "DICOM XML (Native DICOM Model, PS3.19 Annex A) serialization for pydicom"
+requires-python = ">=3.12"
+dependencies = [
+    "pydicom>=3.0.2",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.20.2",
+    "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
+    "pytest-json-report>=1.5.0",
+    "ruff>=0.15.12",
+]
+
+[tool.ruff]
+line-length = 127
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+    "D",   # pydocstyle
+    "ANN", # flake8-annotations
+    "TRY", # tryceratops
+    "PTH", # flake8-use-pathlib
+    "S",   # bandit security
+    "ARG", # flake8-unused-arguments
+    "RUF", # ruff-specific rules
+    "PLC", # pylint convention (enables PLC0415 import-outside-toplevel)
+]
+ignore = [
+    "D100", # Missing docstring in public module (module-level covered by module docstring)
+    "D104", # Missing docstring in public package
+    "D107", # Missing docstring in __init__
+    "ANN401", # Dynamically typed expressions (Any) — needed for pydicom compatibility
+    "S314",   # suspicious-xml-element-tree-usage — trusted DICOM sources
+    "PLC0415", # import-outside-toplevel: used intentionally to avoid circular imports (same as pydicom)
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "D",    # docstring rules relaxed in tests
+    "ANN",  # type annotation rules relaxed in tests
+    "S101", # assert allowed in tests
+    "ARG",  # unused arguments allowed in test fixtures
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_any_generics = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
