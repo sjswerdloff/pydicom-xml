@@ -877,6 +877,18 @@ _MAX_BOUNDARY_LENGTH = 70
 #              <"> / "/" / "[" / "]" / "?" / "=" / SPACE
 _TSPECIALS = frozenset('()<>@,;:\\"/[]?= ')
 
+# Acceptable MIME media types for parts in a DICOMWeb multipart/related response.
+# application/dicom+xml is the canonical type (PS3.18).  text/xml and
+# application/xml are accepted for interoperability with conformant but
+# loosely-typed servers.
+_ACCEPTABLE_XML_MEDIA_TYPES = frozenset(
+    {
+        "application/dicom+xml",
+        "text/xml",
+        "application/xml",
+    }
+)
+
 
 def _validate_boundary(boundary: str) -> None:
     """Validate that a boundary string conforms to RFC 2046 Section 5.1.1.
@@ -986,17 +998,31 @@ def _check_part_content_type(header_block: bytes) -> None:
         ValueError: If the Content-Type is present but not XML-compatible.
 
     """
+    if not header_block:
+        return
+
+    # Normalize line endings and unfold continuation lines (RFC 2822 §2.2.3:
+    # a line starting with whitespace is a continuation of the previous line).
+    normalized = header_block.replace(b"\r\n", b"\n")
+    # Join continuation lines: replace "\n<SP/TAB>" with a single space
+    unfolded = b""
+    for i, line in enumerate(normalized.split(b"\n")):
+        if i > 0 and line and line[0:1] in (b" ", b"\t"):
+            # Continuation line — append to previous
+            unfolded += b" " + line.strip()
+        else:
+            if i > 0:
+                unfolded += b"\n"
+            unfolded += line
+
     content_type_value: str | None = None
-    # Normalize line endings: replace CRLF with LF, then split on LF
-    lines = header_block.replace(b"\r\n", b"\n").split(b"\n")
-    for line in lines:
+    for line in unfolded.split(b"\n"):
         stripped_line = line.strip()
         if not stripped_line:
             continue
         # Match exactly "content-type:" (case-insensitive) to avoid
         # false matches on headers that merely start with the same prefix.
-        lower_line = stripped_line.lower()
-        if lower_line.startswith(b"content-type:"):
+        if stripped_line.lower().startswith(b"content-type:"):
             _, _, ct_value = stripped_line.partition(b":")
             content_type_value = ct_value.strip().decode("ascii", errors="replace")
             break
@@ -1008,13 +1034,11 @@ def _check_part_content_type(header_block: bytes) -> None:
     # Normalize: take only the media type (ignore parameters like charset)
     media_type = content_type_value.split(";")[0].strip().lower()
 
-    acceptable_types = {
-        "application/dicom+xml",
-        "text/xml",
-        "application/xml",
-    }
-    if media_type not in acceptable_types:
-        msg = f"Unexpected Content-Type in multipart part: '{content_type_value}'. Expected one of: {sorted(acceptable_types)}"
+    if media_type not in _ACCEPTABLE_XML_MEDIA_TYPES:
+        msg = (
+            f"Unexpected Content-Type in multipart part: '{content_type_value}'. "
+            f"Expected one of: {sorted(_ACCEPTABLE_XML_MEDIA_TYPES)}"
+        )
         raise ValueError(msg)
 
 
@@ -1066,9 +1090,8 @@ def datasets_from_multipart_xml(
         if not xml_body:
             continue
 
-        # Validate per-part Content-Type if headers are present
-        if header_block:
-            _check_part_content_type(header_block)
+        # Validate per-part Content-Type
+        _check_part_content_type(header_block)
 
         result = dataset_from_xml(
             xml_body,

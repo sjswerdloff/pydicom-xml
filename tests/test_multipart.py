@@ -255,6 +255,21 @@ class TestBoundaryQuotingIntegration:
         assert 'boundary="' not in ct
         assert "boundary=pydicom-xml-" in ct
 
+    def test_tspecial_boundary_without_space_round_trips(self):
+        """Boundary with tspecial (no space) is quoted and round-trips."""
+        ds = Dataset()
+        ds.PatientID = "TSPECIAL-TEST"
+        body, ct = datasets_to_multipart_xml([ds], boundary="bound=ary")
+        # Header must be quoted
+        assert 'boundary="bound=ary"' in ct
+        # Body uses unquoted delimiter
+        assert b"--bound=ary" in body
+        # Round-trip succeeds
+        boundary = extract_boundary(ct)
+        result = datasets_from_multipart_xml(body, boundary)
+        assert len(result) == 1
+        assert result[0].PatientID == "TSPECIAL-TEST"
+
 
 class TestPartContentTypeValidation:
     """Tests for per-part Content-Type checking in datasets_from_multipart_xml."""
@@ -285,6 +300,15 @@ class TestPartContentTypeValidation:
 
     def test_empty_header_block_accepted(self):
         _check_part_content_type(b"")
+
+    def test_folded_content_type_header_accepted(self):
+        """RFC 2822 folded headers (continuation lines) are unfolded."""
+        header_block = b"Content-Type:\r\n application/dicom+xml"
+        _check_part_content_type(header_block)
+
+    def test_folded_content_type_with_tab_accepted(self):
+        header_block = b"Content-Type:\r\n\tapplication/dicom+xml; charset=utf-8"
+        _check_part_content_type(header_block)
 
     def test_json_content_type_rejected(self):
         header_block = b"Content-Type: application/dicom+json"
