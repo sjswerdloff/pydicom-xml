@@ -145,20 +145,34 @@ class TestXmlDataElementConverterValues:
         assert isinstance(result, float)
         assert result == pytest.approx(2.718281828)
 
-    def test_ds_returns_float_value(self) -> None:
-        """Contract: DS Value element returns a float (DS is in FLOAT_VR in pydicom)."""
+    def test_ds_returns_ds_type_preserving_string(self) -> None:
+        """Contract: DS Value element returns pydicom DSfloat (preserves string representation)."""
+        from pydicom.valuerep import DSfloat
+
         attr = _make_dicom_attribute("00180088", "DS", [_make_value_child(1, "1.5")])
         converter = XmlDataElementConverter(Dataset, attr)
         result = converter.get_element_values()
-        # pydicom's FLOAT_VR includes DS, so _coerce_value returns float
+        assert isinstance(result, DSfloat)
         assert float(result) == pytest.approx(1.5)
 
-    def test_is_returns_int_value(self) -> None:
-        """Contract: IS Value element returns an int (IS is in INT_VR in pydicom)."""
+    def test_ds_preserves_string_representation(self) -> None:
+        """Contract: DS with exact decimal text preserves the original string on round-trip."""
+        from pydicom.valuerep import DSfloat
+
+        attr = _make_dicom_attribute("00180088", "DS", [_make_value_child(1, "1.000")])
+        converter = XmlDataElementConverter(Dataset, attr)
+        result = converter.get_element_values()
+        assert isinstance(result, DSfloat)
+        assert str(result) == "1.000"
+
+    def test_is_returns_is_type(self) -> None:
+        """Contract: IS Value element returns pydicom IS (not plain int)."""
+        from pydicom.valuerep import IS
+
         attr = _make_dicom_attribute("00200013", "IS", [_make_value_child(1, "42")])
         converter = XmlDataElementConverter(Dataset, attr)
         result = converter.get_element_values()
-        # pydicom's INT_VR includes IS, so _coerce_value returns int
+        assert isinstance(result, IS)
         assert int(result) == 42
 
     def test_multivalued_lo_returns_multivalue(self) -> None:
@@ -640,3 +654,466 @@ class TestDatasetFromXml:
         result = dataset_from_xml(xml_bytes, bulk_data_uri_handler=resolve)
         assert result[Tag(0x7FE0, 0x0010)].value == payload
         assert calls == [("7FE00010", "OW", "http://example.com/pixel")]
+
+
+# ---------------------------------------------------------------------------
+# Critical fix 1: DS/IS type preservation
+# ---------------------------------------------------------------------------
+
+
+class TestCoerceValueDsIs:
+    def test_ds_round_trip_preserves_string_repr(self) -> None:
+        """Contract: DS "1.000" survives round-trip with exact string representation."""
+        from pydicom.valuerep import DSfloat
+
+        ds = Dataset()
+        # Build a DSfloat with the original string representation
+        ds.add_new(Tag(0x0018, 0x0088), "DS", DSfloat("1.000"))
+        result = dataset_from_xml(dataset_to_xml(ds))
+        val = result[Tag(0x0018, 0x0088)].value
+        assert isinstance(val, DSfloat)
+        assert str(val) == "1.000"
+
+    def test_is_round_trip_returns_is_type(self) -> None:
+        """Contract: IS value returns pydicom IS type (not plain int) after round-trip."""
+        from pydicom.valuerep import IS
+
+        ds = Dataset()
+        ds.add_new(Tag(0x0020, 0x0013), "IS", IS("99"))
+        result = dataset_from_xml(dataset_to_xml(ds))
+        val = result[Tag(0x0020, 0x0013)].value
+        assert isinstance(val, IS)
+        assert int(val) == 99
+
+    def test_ds_returns_dsfloat_not_plain_float(self) -> None:
+        """Contract: _coerce_value for DS returns DSfloat instance, not plain float."""
+        from pydicom.valuerep import DSfloat
+
+        from pydicom_xml.xmlrep import _coerce_value
+
+        result = _coerce_value("3.14", "DS")
+        # DSfloat is a subclass of float, but it carries string representation.
+        # The key check: it must be DSfloat (not just any float).
+        assert isinstance(result, DSfloat)
+
+    def test_is_returns_is_not_int(self) -> None:
+        """Contract: _coerce_value for IS returns IS instance, not plain int."""
+        from pydicom.valuerep import IS
+
+        from pydicom_xml.xmlrep import _coerce_value
+
+        result = _coerce_value("42", "IS")
+        assert isinstance(result, IS)
+
+
+# ---------------------------------------------------------------------------
+# Critical fix 2: Multi-valued PersonName returns MultiValue
+# ---------------------------------------------------------------------------
+
+
+class TestMultiValuedPersonName:
+    def test_multi_pn_decode_returns_multivalue(self) -> None:
+        """Contract: DicomAttribute with two PersonName elements returns MultiValue."""
+        from pydicom.multival import MultiValue
+
+        from pydicom_xml.xmlrep import _decode_person_name
+
+        ns = f"{{{NAMESPACE}}}"
+        attr = ET.Element(f"{ns}DicomAttribute")
+        attr.set("tag", "00100010")
+        attr.set("vr", "PN")
+
+        for idx, name_str in enumerate(["Smith^John", "Doe^Jane"], start=1):
+            pn_elem = ET.SubElement(attr, f"{ns}PersonName")
+            pn_elem.set("number", str(idx))
+            alpha = ET.SubElement(pn_elem, f"{ns}Alphabetic")
+            parts = name_str.split("^")
+            family = ET.SubElement(alpha, f"{ns}FamilyName")
+            family.text = parts[0]
+            given = ET.SubElement(alpha, f"{ns}GivenName")
+            given.text = parts[1]
+
+        result = _decode_person_name(attr)
+        assert isinstance(result, MultiValue)
+        assert len(result) == 2
+
+    def test_multi_pn_round_trip_preserves_both_names(self) -> None:
+        """Contract: two-name PN field survives to_xml/from_xml with both names present."""
+        from pydicom.multival import MultiValue
+        from pydicom.valuerep import PersonName
+
+        ds = Dataset()
+        pn1 = PersonName("Smith^John")
+        pn2 = PersonName("Doe^Jane")
+        ds.add_new(Tag(0x0010, 0x0010), "PN", MultiValue(PersonName, [pn1, pn2]))
+
+        result = dataset_from_xml(dataset_to_xml(ds))
+        val = result[Tag(0x0010, 0x0010)].value
+        assert isinstance(val, MultiValue)
+        assert len(val) == 2
+        assert str(val[0]) == "Smith^John"
+        assert str(val[1]) == "Doe^Jane"
+
+
+# ---------------------------------------------------------------------------
+# Critical fix 3: ET.ParseError raised as DicomXmlParseError
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedXmlRaisesParseError:
+    def test_garbage_bytes_raise_parse_error(self) -> None:
+        """Contract: garbage input to dataset_from_xml raises DicomXmlParseError."""
+        from pydicom_xml.xmlrep import DicomXmlParseError
+
+        with pytest.raises(DicomXmlParseError):
+            dataset_from_xml(b"this is not xml at all <<<")
+
+    def test_truncated_xml_raises_parse_error(self) -> None:
+        """Contract: truncated XML raises DicomXmlParseError, not ET.ParseError."""
+        from pydicom_xml.xmlrep import DicomXmlParseError
+
+        with pytest.raises(DicomXmlParseError):
+            dataset_from_xml(b"<?xml version='1.0'?><NativeDicomModel")
+
+    def test_parse_error_is_subclass_of_dicom_xml_error(self) -> None:
+        """Contract: DicomXmlParseError is a subclass of DicomXmlError."""
+        from pydicom_xml.xmlrep import DicomXmlError, DicomXmlParseError
+
+        assert issubclass(DicomXmlParseError, DicomXmlError)
+
+    def test_parse_error_exported_from_package(self) -> None:
+        """Contract: DicomXmlParseError is importable from pydicom_xml."""
+        from pydicom_xml import DicomXmlParseError
+
+        assert DicomXmlParseError is not None
+
+
+# ---------------------------------------------------------------------------
+# Critical fix 4: empty text in numeric VRs returns empty value
+# ---------------------------------------------------------------------------
+
+
+class TestCoerceValueEmptyText:
+    def test_empty_us_returns_empty_value_not_error(self) -> None:
+        """Contract: _coerce_value("", "US") returns empty value, not ValueError."""
+        from pydicom_xml.xmlrep import _coerce_value
+
+        result = _coerce_value("", "US")
+        # Should not raise — returns empty_value_for_VR("US")
+        assert result is None or result == ""
+
+    def test_whitespace_only_us_returns_empty_value(self) -> None:
+        """Contract: _coerce_value("   ", "US") returns empty value, not ValueError."""
+        from pydicom_xml.xmlrep import _coerce_value
+
+        result = _coerce_value("   ", "US")
+        assert result is None or result == ""
+
+    def test_empty_ds_returns_empty_value(self) -> None:
+        """Contract: _coerce_value("", "DS") returns empty value, not error."""
+        from pydicom_xml.xmlrep import _coerce_value
+
+        result = _coerce_value("", "DS")
+        assert result is None or result == ""
+
+    def test_empty_is_returns_empty_value(self) -> None:
+        """Contract: _coerce_value("", "IS") returns empty value, not error."""
+        from pydicom_xml.xmlrep import _coerce_value
+
+        result = _coerce_value("", "IS")
+        assert result is None or result == ""
+
+
+# ---------------------------------------------------------------------------
+# Fix 5: All exceptions exported from __init__.py
+# ---------------------------------------------------------------------------
+
+
+class TestExceptionExports:
+    def test_all_exceptions_importable_from_package(self) -> None:
+        """Contract: all custom exception classes are importable from pydicom_xml."""
+        import pydicom_xml
+
+        for name in [
+            "DicomXmlError",
+            "DicomXmlAtValueHexError",
+            "DicomXmlAtValueLengthError",
+            "DicomXmlParseError",
+            "DicomXmlRootError",
+            "DicomXmlTagHexError",
+            "DicomXmlTagLengthError",
+        ]:
+            assert hasattr(pydicom_xml, name), f"Missing export: {name}"
+
+    def test_all_exceptions_in_all(self) -> None:
+        """Contract: all custom exception classes appear in pydicom_xml.__all__."""
+        import pydicom_xml
+
+        for name in [
+            "DicomXmlError",
+            "DicomXmlAtValueHexError",
+            "DicomXmlAtValueLengthError",
+            "DicomXmlParseError",
+            "DicomXmlRootError",
+            "DicomXmlTagHexError",
+            "DicomXmlTagLengthError",
+        ]:
+            assert name in pydicom_xml.__all__, f"Missing from __all__: {name}"
+
+
+# ---------------------------------------------------------------------------
+# Fix 6: data_element_to_xml_element private_creator parameter
+# ---------------------------------------------------------------------------
+
+
+class TestDataElementToXmlPrivateCreator:
+    def test_private_creator_set_via_parameter(self) -> None:
+        """Contract: private_creator parameter sets privateCreator attribute on output."""
+        elem = DataElement(Tag(0x0009, 0x1001), "LO", "private value")
+        root = ET.Element(f"{_NS}NativeDicomModel")
+        data_element_to_xml_element(elem, root, private_creator="ACME Corp")
+        attr = root.find(f"{_NS}DicomAttribute")
+        assert attr is not None
+        assert attr.get("privateCreator") == "ACME Corp"
+
+    def test_private_creator_not_set_without_parameter(self) -> None:
+        """Contract: without private_creator parameter the attribute is absent."""
+        elem = DataElement(Tag(0x0009, 0x1001), "LO", "private value")
+        root = ET.Element(f"{_NS}NativeDicomModel")
+        data_element_to_xml_element(elem, root)
+        attr = root.find(f"{_NS}DicomAttribute")
+        assert attr is not None
+        assert attr.get("privateCreator") is None
+
+    def test_private_creator_not_set_for_public_element(self) -> None:
+        """Contract: private_creator parameter is ignored for public elements."""
+        elem = DataElement(Tag(0x0010, 0x0010), "PN", "Smith^John")
+        root = ET.Element(f"{_NS}NativeDicomModel")
+        data_element_to_xml_element(elem, root, private_creator="ACME Corp")
+        attr = root.find(f"{_NS}DicomAttribute")
+        assert attr is not None
+        assert attr.get("privateCreator") is None
+
+    def test_private_creator_not_set_for_creator_element_itself(self) -> None:
+        """Contract: private_creator is not set on the private creator tag itself."""
+        # A private creator element has is_private_creator == True
+        elem = DataElement(Tag(0x0009, 0x0010), "LO", "ACME Corp")
+        root = ET.Element(f"{_NS}NativeDicomModel")
+        data_element_to_xml_element(elem, root, private_creator="ACME Corp")
+        attr = root.find(f"{_NS}DicomAttribute")
+        assert attr is not None
+        assert attr.get("privateCreator") is None
+
+
+# ---------------------------------------------------------------------------
+# Fix 8: _parse_tag_and_vr helper (duplicated logic extracted)
+# ---------------------------------------------------------------------------
+
+
+class TestParseTagAndVr:
+    def test_valid_tag_and_vr(self) -> None:
+        """Contract: _parse_tag_and_vr returns correct tag and vr for valid input."""
+        from pydicom_xml.xmlrep import _parse_tag_and_vr
+
+        attr = _make_dicom_attribute("00100010", "PN")
+        tag, vr = _parse_tag_and_vr(attr)
+        assert tag == Tag(0x0010, 0x0010)
+        assert vr == "PN"
+
+    def test_missing_vr_looks_up_data_dictionary(self) -> None:
+        """Contract: absent vr attribute is resolved from DICOM data dictionary."""
+        from pydicom_xml.xmlrep import _parse_tag_and_vr
+
+        attr = ET.Element(f"{_NS}DicomAttribute")
+        attr.set("tag", "00100010")
+        # no vr attribute
+        tag, vr = _parse_tag_and_vr(attr)
+        assert tag == Tag(0x0010, 0x0010)
+        assert vr != ""  # resolved from data dict (should be "PN")
+
+    def test_unknown_tag_missing_vr_falls_back_to_un(self) -> None:
+        """Contract: private/unknown tag with no vr attribute falls back to UN."""
+        from pydicom_xml.xmlrep import _parse_tag_and_vr
+
+        attr = ET.Element(f"{_NS}DicomAttribute")
+        attr.set("tag", "00091001")  # private, no dict entry
+        # no vr attribute
+        _tag, vr = _parse_tag_and_vr(attr)
+        assert vr == "UN"
+
+    def test_tag_too_short_raises_length_error(self) -> None:
+        """Contract: tag shorter than 8 chars raises DicomXmlTagLengthError."""
+        from pydicom_xml.xmlrep import DicomXmlTagLengthError, _parse_tag_and_vr
+
+        attr = ET.Element(f"{_NS}DicomAttribute")
+        attr.set("tag", "1234")
+        attr.set("vr", "LO")
+        with pytest.raises(DicomXmlTagLengthError):
+            _parse_tag_and_vr(attr)
+
+    def test_tag_non_hex_raises_hex_error(self) -> None:
+        """Contract: tag with non-hex chars raises DicomXmlTagHexError."""
+        from pydicom_xml.xmlrep import DicomXmlTagHexError, _parse_tag_and_vr
+
+        attr = ET.Element(f"{_NS}DicomAttribute")
+        attr.set("tag", "ZZZZYYYY")
+        attr.set("vr", "LO")
+        with pytest.raises(DicomXmlTagHexError):
+            _parse_tag_and_vr(attr)
+
+
+# ---------------------------------------------------------------------------
+# Fix 10-11: Additional VR coverage
+# ---------------------------------------------------------------------------
+
+
+class TestAdditionalVrCoverage:
+    def test_sv_64bit_int_round_trip(self) -> None:
+        """Contract: SV (64-bit signed integer) round-trips correctly."""
+        ds = Dataset()
+        ds.add_new(Tag(0x0018, 0x9728), "SV", -9007199254740992)
+        result = dataset_from_xml(dataset_to_xml(ds))
+        assert result[Tag(0x0018, 0x9728)].value == -9007199254740992
+
+    def test_uv_64bit_uint_round_trip(self) -> None:
+        """Contract: UV (64-bit unsigned integer) round-trips correctly."""
+        ds = Dataset()
+        ds.add_new(Tag(0x0018, 0x9729), "UV", 9007199254740992)
+        result = dataset_from_xml(dataset_to_xml(ds))
+        assert result[Tag(0x0018, 0x9729)].value == 9007199254740992
+
+    def test_od_binary_vr_round_trip(self) -> None:
+        """Contract: OD binary VR survives round-trip byte-for-byte."""
+        payload = bytes(range(16))
+        ds = Dataset()
+        ds.add_new(Tag(0x0066, 0x0009), "OD", payload)
+        result = dataset_from_xml(dataset_to_xml(ds))
+        assert result[Tag(0x0066, 0x0009)].value == payload
+
+    def test_ol_binary_vr_round_trip(self) -> None:
+        """Contract: OL binary VR survives round-trip byte-for-byte."""
+        payload = bytes(range(12))
+        ds = Dataset()
+        ds.add_new(Tag(0x0066, 0x000F), "OL", payload)
+        result = dataset_from_xml(dataset_to_xml(ds))
+        assert result[Tag(0x0066, 0x000F)].value == payload
+
+    def test_uc_unlimited_chars_round_trip(self) -> None:
+        """Contract: UC (Unlimited Characters) VR round-trips correctly."""
+        ds = Dataset()
+        ds.add_new(Tag(0x0008, 0x0119), "UC", "Hello World UC")
+        result = dataset_from_xml(dataset_to_xml(ds))
+        assert result[Tag(0x0008, 0x0119)].value == "Hello World UC"
+
+    def test_ur_universal_resource_round_trip(self) -> None:
+        """Contract: UR (Universal Resource Identifier) VR round-trips correctly."""
+        ds = Dataset()
+        ds.add_new(Tag(0x0008, 0x1190), "UR", "http://example.com/resource")
+        result = dataset_from_xml(dataset_to_xml(ds))
+        assert result[Tag(0x0008, 0x1190)].value == "http://example.com/resource"
+
+    def test_ut_unlimited_text_round_trip(self) -> None:
+        """Contract: UT (Unlimited Text) VR round-trips correctly."""
+        long_text = "A" * 200
+        ds = Dataset()
+        ds.add_new(Tag(0x0042, 0x0013), "UT", long_text)
+        result = dataset_from_xml(dataset_to_xml(ds))
+        assert result[Tag(0x0042, 0x0013)].value == long_text
+
+    def test_ae_application_entity_round_trip(self) -> None:
+        """Contract: AE (Application Entity) VR round-trips correctly."""
+        ds = Dataset()
+        ds.add_new(Tag(0x0008, 0x0054), "AE", "MY_SCP")
+        result = dataset_from_xml(dataset_to_xml(ds))
+        assert result[Tag(0x0008, 0x0054)].value == "MY_SCP"
+
+    def test_dt_datetime_round_trip(self) -> None:
+        """Contract: DT (DateTime) VR round-trips correctly."""
+        ds = Dataset()
+        ds.add_new(Tag(0x0008, 0x002A), "DT", "20240101120000.000000")
+        result = dataset_from_xml(dataset_to_xml(ds))
+        assert result[Tag(0x0008, 0x002A)].value == "20240101120000.000000"
+
+    def test_tm_time_round_trip(self) -> None:
+        """Contract: TM (Time) VR round-trips correctly."""
+        ds = Dataset()
+        ds.add_new(Tag(0x0008, 0x0030), "TM", "120000.000")
+        result = dataset_from_xml(dataset_to_xml(ds))
+        assert result[Tag(0x0008, 0x0030)].value == "120000.000"
+
+    def test_lt_long_text_round_trip(self) -> None:
+        """Contract: LT (Long Text) VR round-trips correctly."""
+        ds = Dataset()
+        ds.add_new(Tag(0x0010, 0x21B0), "LT", "Patient additional history text.")
+        result = dataset_from_xml(dataset_to_xml(ds))
+        assert result[Tag(0x0010, 0x21B0)].value == "Patient additional history text."
+
+    def test_st_short_text_round_trip(self) -> None:
+        """Contract: ST (Short Text) VR round-trips correctly."""
+        ds = Dataset()
+        ds.add_new(Tag(0x0008, 0x1030), "ST", "Study description text")
+        result = dataset_from_xml(dataset_to_xml(ds))
+        assert result[Tag(0x0008, 0x1030)].value == "Study description text"
+
+
+class TestInlineBinaryEdgeCases:
+    def test_invalid_base64_in_inline_binary(self) -> None:
+        """Contract: invalid base64 in InlineBinary raises an error, not silent failure."""
+        xml = (
+            f'<?xml version="1.0" encoding="utf-8"?>'
+            f'<NativeDicomModel xmlns="{NAMESPACE}">'
+            f'<DicomAttribute tag="7FE00010" vr="OW">'
+            f"<InlineBinary>!!NOT VALID BASE64!!</InlineBinary>"
+            f"</DicomAttribute>"
+            f"</NativeDicomModel>"
+        ).encode()
+        with pytest.raises((ValueError, Exception)):
+            dataset_from_xml(xml)
+
+    def test_missing_vr_attribute_falls_back_to_un(self) -> None:
+        """Contract: DicomAttribute without vr attribute uses UN as fallback for unknown tags."""
+        ns = NAMESPACE
+        # Use a private tag that won't be in the data dictionary
+        xml = (
+            f'<?xml version="1.0" encoding="utf-8"?>'
+            f'<NativeDicomModel xmlns="{ns}">'
+            f'<DicomAttribute tag="00091001">'
+            f'<Value number="1">test</Value>'
+            f"</DicomAttribute>"
+            f"</NativeDicomModel>"
+        ).encode()
+        result = dataset_from_xml(xml)
+        assert Tag(0x0009, 0x1001) in result
+        assert result[Tag(0x0009, 0x1001)].VR == "UN"
+
+    def test_bulk_data_inside_sequence_item(self) -> None:
+        """Contract: BulkData element inside a SQ item is handled correctly."""
+        payload = bytes(range(64)) * 5  # 320 bytes
+
+        def to_uri(de: DataElement) -> str:
+            return "http://example.com/item-bulk"
+
+        item = Dataset()
+        item.add_new(Tag(0x7FE0, 0x0010), "OW", payload)
+        ds = Dataset()
+        from pydicom.sequence import Sequence
+
+        ds.add_new(Tag(0x5200, 0x9230), "SQ", Sequence([item]))
+        xml_bytes = dataset_to_xml(ds, bulk_data_threshold=100, bulk_data_element_handler=to_uri)
+
+        def from_uri(_tag: str, _vr: str, _uri: str) -> bytes:
+            return payload
+
+        result = dataset_from_xml(xml_bytes, bulk_data_uri_handler=from_uri)
+        inner = result[Tag(0x5200, 0x9230)].value[0]
+        assert inner[Tag(0x7FE0, 0x0010)].value == payload
+
+    def test_private_creator_attribute_in_xml_output(self) -> None:
+        """Contract: dataset_to_xml sets privateCreator on private non-creator elements."""
+        ds = Dataset()
+        ds.add_new(Tag(0x0009, 0x0010), "LO", "My Creator")
+        ds.add_new(Tag(0x0009, 0x1001), "LO", "private data")
+        root = ET.fromstring(dataset_to_xml(ds).decode("utf-8"))
+        priv = root.find(f".//{_NS}DicomAttribute[@tag='00091001']")
+        assert priv is not None
+        assert priv.get("privateCreator") == "My Creator"

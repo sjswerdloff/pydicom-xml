@@ -142,11 +142,16 @@ class DicomXmlRootError(DicomXmlError):
         self.actual_tag = actual_tag
 
 
-# ---------------------------------------------------------------------------
-# Namespace registration (once at import time)
-# ---------------------------------------------------------------------------
+class DicomXmlParseError(DicomXmlError):
+    """Raised when the XML input cannot be parsed (malformed XML)."""
 
-ET.register_namespace("", NAMESPACE)
+    def __init__(self, detail: str) -> None:
+        """Initialize with the XML parse error detail.
+
+        Args:
+            detail: Human-readable explanation from the XML parser.
+        """
+        super().__init__(f"XML parse error: {detail}")
 
 
 # ---------------------------------------------------------------------------
@@ -220,8 +225,9 @@ class XmlDataElementConverter:
         value_elems = attr.findall(f"{_NS_PREFIX}Value")
 
         if items:
-            # SQ — recurse
-            return Sequence([_element_to_dataset(self.dataset_class, item) for item in items])
+            # SQ — recurse, forwarding the bulk_data_element_handler so BulkData
+            # elements inside sequence items are resolved correctly.
+            return Sequence([_element_to_dataset(self.dataset_class, item, self.bulk_data_element_handler) for item in items])
 
         if pn_elems:
             return _decode_person_name(attr)
@@ -381,7 +387,11 @@ def _encode_binary(
     Args:
         elem: pydicom DataElement with a binary VR.
         parent: XML element to append the encoding to.
-        bulk_data_threshold: Byte threshold above which BulkData URI is used.
+        bulk_data_threshold: Threshold in bytes for switching to BulkData URI.
+            The comparison is ``len(raw_bytes) > (threshold // 4) * 3``, which
+            converts the base64-encoded length threshold to the equivalent raw byte
+            count (base64 expands by 4/3).  This matches the semantics of
+            ``DataElement.to_json_dict()``.
         bulk_data_element_handler: Callable that returns the BulkData URI string.
     """
     raw: bytes = elem.value
@@ -490,14 +500,14 @@ def _parse_pn_group(group_elem: ET.Element) -> str:
     return "^".join(parts)
 
 
-def _decode_person_name(attr_elem: ET.Element) -> PersonName | list[PersonName]:
+def _decode_person_name(attr_elem: ET.Element) -> PersonName | MultiValue[PersonName]:
     """Decode all ``<PersonName>`` children of a DicomAttribute into a PersonName value.
 
     Args:
         attr_elem: A ``<DicomAttribute vr="PN">`` element.
 
     Returns:
-        A single PersonName if only one is present, or a list for multi-valued PN.
+        A single PersonName if only one is present, or a MultiValue for multi-valued PN.
     """
     pn_elems = attr_elem.findall(f"{_NS_PREFIX}PersonName")
     results: list[PersonName] = []
@@ -516,7 +526,7 @@ def _decode_person_name(attr_elem: ET.Element) -> PersonName | list[PersonName]:
 
     if len(results) == 1:
         return results[0]
-    return results
+    return MultiValue(PersonName, results)
 
 
 def _coerce_value(text: str, vr: str) -> Any:
@@ -545,16 +555,22 @@ def _coerce_value(text: str, vr: str) -> Any:
         DicomXmlAtValueLengthError: If AT value text is not exactly 8 characters.
         DicomXmlAtValueHexError: If AT value text contains non-hex characters.
     """
+    from pydicom.dataelem import empty_value_for_VR
     from pydicom.valuerep import DS, IS
 
-    if vr in (INT_VR - {VR.AT}) | {VR.US_SS}:
-        return int(text)
-    if vr in FLOAT_VR:
-        return float(text)
+    if not text or not text.strip():
+        return empty_value_for_VR(vr)
+    # DS and IS must be checked before generic FLOAT_VR/INT_VR because pydicom's
+    # FLOAT_VR includes DS and INT_VR includes IS.  Checking first preserves the
+    # pydicom wrapper type (DS/IS) which carries the original string representation.
     if vr == "DS":
         return DS(text)
     if vr == "IS":
         return IS(text)
+    if vr in (INT_VR - {VR.AT}) | {VR.US_SS}:
+        return int(text)
+    if vr in FLOAT_VR:
+        return float(text)
     if vr == "AT":
         if len(text) != 8:
             raise DicomXmlAtValueLengthError(text)
@@ -586,7 +602,49 @@ def _decode_values(attr_elem: ET.Element, vr: str) -> Any:
     return MultiValue(type(coerced[0]), coerced)
 
 
-def _element_to_dataset(dataset_class: type[Dataset], parent: ET.Element) -> Dataset:
+def _parse_tag_and_vr(attr_elem: ET.Element) -> tuple[BaseTag, str]:
+    """Parse the ``tag`` and ``vr`` attributes from a ``<DicomAttribute>`` element.
+
+    Extracted from ``dataset_from_xml`` and ``_element_to_dataset`` to avoid
+    duplicating the same tag-parsing logic in both functions.
+
+    Args:
+        attr_elem: A ``<DicomAttribute>`` XML element.
+
+    Returns:
+        Tuple of ``(tag, vr)`` where ``vr`` is resolved from the data dictionary
+        when the attribute is absent, and falls back to ``"UN"`` for unknown tags.
+
+    Raises:
+        DicomXmlTagLengthError: If the ``tag`` attribute is not exactly 8 characters.
+        DicomXmlTagHexError: If the ``tag`` attribute contains non-hex characters.
+    """
+    import pydicom.datadict as dd
+
+    tag_str = attr_elem.get("tag", "")
+    if len(tag_str) != 8:
+        raise DicomXmlTagLengthError(tag_str)
+    try:
+        tag = Tag(int(tag_str[:4], 16), int(tag_str[4:], 16))
+    except ValueError as exc:
+        raise DicomXmlTagHexError(tag_str) from exc
+
+    vr: str = attr_elem.get("vr", "")
+    if not vr:
+        try:
+            entry = dd.get_entry(tag)
+            vr = entry[0]
+        except KeyError:
+            vr = "UN"
+
+    return tag, vr
+
+
+def _element_to_dataset(
+    dataset_class: type[Dataset],
+    parent: ET.Element,
+    bulk_data_element_handler: BulkDataHandlerType = None,
+) -> Dataset:
     """Recursively convert ``<DicomAttribute>`` XML children to a pydicom Dataset.
 
     Per PS3.19 A.1, each ``<DicomAttribute>`` has a ``tag`` and ``vr`` attribute.
@@ -595,6 +653,8 @@ def _element_to_dataset(dataset_class: type[Dataset], parent: ET.Element) -> Dat
     Args:
         dataset_class: The Dataset subclass to instantiate for each item.
         parent: A ``<NativeDicomModel>`` or ``<Item>`` XML element.
+        bulk_data_element_handler: Optional handler forwarded to converters so
+            BulkData elements inside sequence items can be resolved.
 
     Returns:
         pydicom Dataset populated from the XML children.
@@ -603,29 +663,11 @@ def _element_to_dataset(dataset_class: type[Dataset], parent: ET.Element) -> Dat
         DicomXmlTagLengthError: If a tag attribute string is not exactly 8 characters.
         DicomXmlTagHexError: If a tag attribute string contains non-hex characters.
     """
-    import pydicom.datadict as dd
-
     ds = dataset_class()
 
     for attr_elem in parent.findall(f"{_NS_PREFIX}DicomAttribute"):
-        tag_str = attr_elem.get("tag", "")
-        if len(tag_str) != 8:
-            raise DicomXmlTagLengthError(tag_str)
-        try:
-            tag = Tag(int(tag_str[:4], 16), int(tag_str[4:], 16))
-        except ValueError as exc:
-            raise DicomXmlTagHexError(tag_str) from exc
-
-        vr: str = attr_elem.get("vr", "")
-        if not vr:
-            # Attempt dictionary lookup; fall back to UN for unknown tags
-            try:
-                entry = dd.get_entry(tag)
-                vr = entry[0]
-            except KeyError:
-                vr = "UN"
-
-        converter = XmlDataElementConverter(dataset_class, attr_elem)
+        tag, vr = _parse_tag_and_vr(attr_elem)
+        converter = XmlDataElementConverter(dataset_class, attr_elem, bulk_data_element_handler)
         value = converter.get_element_values()
         ds.add(DataElement(tag, vr, value))
 
@@ -642,6 +684,7 @@ def data_element_to_xml_element(
     parent: ET.Element,
     bulk_data_threshold: int = 1024,
     bulk_data_element_handler: Callable[[DataElement], str] | None = None,
+    private_creator: str | None = None,
 ) -> ET.Element:
     """Convert a DataElement to an XML ``<DicomAttribute>`` element appended to ``parent``.
 
@@ -660,6 +703,10 @@ def data_element_to_xml_element(
             BulkData URI rather than InlineBinary.  Ignored when no handler is given.
         bulk_data_element_handler: Callable accepting a DataElement and returning the
             ``BulkDataURI`` string.  Mirrors ``DataElement.to_json_dict()`` parameter.
+        private_creator: Optional private creator string.  When provided and the element
+            is a private non-creator element, the ``privateCreator`` attribute is set.
+            Use this when calling the function outside a Dataset context where the creator
+            cannot be looked up automatically.
 
     Returns:
         The newly created ``<DicomAttribute>`` XML element.
@@ -673,6 +720,9 @@ def data_element_to_xml_element(
     kw = dd.keyword_for_tag(data_element.tag)
     if kw:
         attr_elem.set("keyword", kw)
+
+    if private_creator and data_element.tag.is_private and not data_element.tag.is_private_creator:
+        attr_elem.set("privateCreator", private_creator)
 
     if not data_element.is_empty:
         vr = data_element.VR
@@ -718,6 +768,9 @@ def dataset_to_xml(
     Returns:
         UTF-8 encoded XML bytes with XML declaration.
     """
+    # Register namespace here rather than at module import time to limit the
+    # process-global side effect to callers that actually serialise XML.
+    ET.register_namespace("", NAMESPACE)
     root = ET.Element(f"{_NS_PREFIX}NativeDicomModel")
     root.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
     _dataset_to_xml_element(dataset, root, bulk_data_threshold, bulk_data_element_handler)
@@ -758,6 +811,7 @@ def dataset_from_xml(
         pydicom Dataset populated from the XML.
 
     Raises:
+        DicomXmlParseError: If the input cannot be parsed as XML.
         DicomXmlRootError: If the XML root element is not NativeDicomModel in the
             correct namespace.
         DicomXmlTagLengthError: If any DicomAttribute has a malformed tag attribute.
@@ -770,7 +824,10 @@ def dataset_from_xml(
     else:
         xml_bytes = xml_data
 
-    root = ET.fromstring(xml_bytes.decode("utf-8"))
+    try:
+        root = ET.fromstring(xml_bytes.decode("utf-8"))
+    except ET.ParseError as exc:
+        raise DicomXmlParseError(str(exc)) from exc
 
     if root.tag != f"{_NS_PREFIX}NativeDicomModel":
         raise DicomXmlRootError(root.tag)
@@ -790,24 +847,7 @@ def dataset_from_xml(
     # Use a dataset_class-aware converter for the top-level dataset
     ds = dataset_class()
     for attr_elem in root.findall(f"{_NS_PREFIX}DicomAttribute"):
-        tag_str_raw = attr_elem.get("tag", "")
-        if len(tag_str_raw) != 8:
-            raise DicomXmlTagLengthError(tag_str_raw)
-        try:
-            tag = Tag(int(tag_str_raw[:4], 16), int(tag_str_raw[4:], 16))
-        except ValueError as exc:
-            raise DicomXmlTagHexError(tag_str_raw) from exc
-
-        import pydicom.datadict as dd
-
-        vr: str = attr_elem.get("vr", "")
-        if not vr:
-            try:
-                entry = dd.get_entry(tag)
-                vr = entry[0]
-            except KeyError:
-                vr = "UN"
-
+        tag, vr = _parse_tag_and_vr(attr_elem)
         converter = XmlDataElementConverter(dataset_class, attr_elem, handler)
         value = converter.get_element_values()
         ds.add(DataElement(tag, vr, value))

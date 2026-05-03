@@ -14,7 +14,7 @@ DICOMweb servers are **required** to support both `application/dicom+json` and `
 pip install pydicom-xml
 ```
 
-Requires Python 3.12+ and pydicom 3.0+.
+Requires Python 3.10+ and pydicom 3.0+.
 
 ## Usage
 

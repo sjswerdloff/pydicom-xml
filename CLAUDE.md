@@ -45,3 +45,29 @@ Running `uv pip install -e .` requires hatchling (or another build backend) to b
 Adding `[build-system]` and `[tool.hatch.build.targets.wheel]` sections is needed for editable
 installs to work. Alternatively, `uv sync` with the package as a workspace member handles this
 automatically.
+
+## pydicom DS is a factory function, not a class
+
+`pydicom.valuerep.DS` is a factory function that returns either `DSfloat` or `DSdecimal`
+(depending on `pydicom.config.use_DS_decimal`). `isinstance(x, DS)` always returns False.
+Use `isinstance(x, DSfloat)` or `isinstance(x, (DSfloat, DSdecimal))` for type checks.
+`DSfloat` is a subclass of `float`, so `isinstance(DSfloat("1.0"), float)` is True.
+
+## _decode_person_name return type requires MultiValue not list
+
+The `_encode_person_name` function checks `isinstance(value, MultiValue)` to detect multi-valued
+PN fields. Returning a plain `list` from `_decode_person_name` breaks this check on the next
+serialization. Always return `MultiValue(PersonName, results)` for multiple PN values.
+
+## BulkData handler must be forwarded through SQ recursion
+
+`XmlDataElementConverter.get_element_values()` recurses into SQ items via `_element_to_dataset`.
+The `bulk_data_element_handler` must be explicitly passed to `_element_to_dataset` so that BulkData
+elements inside sequence items can be resolved. Without this, BulkData inside SQ silently returns
+`None` (the result of `empty_value_for_VR`).
+
+## ET.register_namespace is process-global
+
+`ET.register_namespace("", NAMESPACE)` affects every XML serialization in the process for that
+namespace. Moving it from module import time into `dataset_to_xml()` limits the side effect to
+callers that actually serialize — tests that only call `dataset_from_xml` are not affected.
