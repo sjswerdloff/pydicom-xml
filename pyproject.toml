@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "pydicom-xml"
 version = "0.1.0"
 description = "DICOM XML (Native DICOM Model, PS3.19 Annex A) serialization for pydicom"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = [
     "pydicom>=3.0.2",
 ]
@@ -22,7 +22,7 @@ dev = [
 
 [tool.ruff]
 line-length = 127
-target-version = "py312"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = [
@@ -63,7 +63,7 @@ convention = "google"
 ]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.10"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
