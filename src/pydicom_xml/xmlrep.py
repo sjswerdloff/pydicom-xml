@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import io
+import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from inspect import signature
@@ -853,3 +854,136 @@ def dataset_from_xml(
         ds.add(DataElement(tag, vr, value))
 
     return ds
+
+
+# ---------------------------------------------------------------------------
+# Multipart XML utilities for DICOMWeb (PS3.18)
+# ---------------------------------------------------------------------------
+
+
+def _generate_boundary() -> str:
+    """Generate a unique MIME boundary string."""
+    return f"pydicom-xml-{uuid.uuid4().hex}"
+
+
+def datasets_to_multipart_xml(
+    datasets: list[Dataset],
+    boundary: str | None = None,
+    bulk_data_threshold: int = 1024,
+    bulk_data_element_handler: Callable[[DataElement], str] | None = None,
+) -> tuple[bytes, str]:
+    """Serialize multiple Datasets as ``multipart/related`` with XML parts.
+
+    Per PS3.18, DICOMWeb search results (e.g., QIDO-RS) with
+    ``Accept: application/dicom+xml`` return a ``multipart/related``
+    response where each part is a standalone NativeDicomModel XML document.
+
+    Args:
+        datasets: List of pydicom Datasets to serialize.
+        boundary: MIME boundary string.  Auto-generated if not provided.
+        bulk_data_threshold: Passed through to ``dataset_to_xml``.
+        bulk_data_element_handler: Passed through to ``dataset_to_xml``.
+
+    Returns:
+        A tuple of ``(body_bytes, content_type_header)``.
+        The content_type_header includes the boundary and type parameters.
+
+    """
+    if boundary is None:
+        boundary = _generate_boundary()
+
+    if not datasets:
+        content_type = f'multipart/related; type="application/dicom+xml"; boundary={boundary}'
+        return f"--{boundary}--\r\n".encode(), content_type
+
+    parts: list[bytes] = []
+    for ds in datasets:
+        xml_bytes = dataset_to_xml(
+            ds,
+            bulk_data_threshold=bulk_data_threshold,
+            bulk_data_element_handler=bulk_data_element_handler,
+        )
+        part_header = (f"--{boundary}\r\nContent-Type: application/dicom+xml\r\n\r\n").encode()
+        parts.append(part_header + xml_bytes + b"\r\n")
+
+    body = b"".join(parts) + f"--{boundary}--\r\n".encode()
+    content_type = f'multipart/related; type="application/dicom+xml"; boundary={boundary}'
+    return body, content_type
+
+
+def datasets_from_multipart_xml(
+    body: bytes,
+    boundary: str,
+    dataset_class: type[Dataset] = Dataset,
+    bulk_data_uri_handler: BulkDataHandlerType | Callable[[str], BulkDataType] | None = None,
+) -> list[Dataset]:
+    """Parse a ``multipart/related`` XML response into a list of Datasets.
+
+    Per PS3.18, DICOMWeb search results with ``application/dicom+xml``
+    use ``multipart/related`` framing with one NativeDicomModel per part.
+
+    Args:
+        body: The raw multipart response body bytes.
+        boundary: The MIME boundary string (from the Content-Type header).
+        dataset_class: Dataset class to use for deserialization.
+        bulk_data_uri_handler: Handler for BulkData URI references.
+
+    Returns:
+        List of pydicom Datasets, one per multipart part.
+
+    """
+    boundary_bytes = f"--{boundary}".encode()
+
+    # Split on boundary markers
+    raw_parts = body.split(boundary_bytes)
+
+    datasets_out: list[Dataset] = []
+    for raw_part in raw_parts:
+        stripped = raw_part.strip()
+        # Skip empty parts (before first boundary) and closing marker
+        if not stripped or stripped == b"--" or stripped.startswith(b"--"):
+            continue
+
+        # Split headers from body on double CRLF
+        if b"\r\n\r\n" in stripped:
+            xml_body = stripped.split(b"\r\n\r\n", 1)[1].strip()
+        elif b"\n\n" in stripped:
+            xml_body = stripped.split(b"\n\n", 1)[1].strip()
+        else:
+            xml_body = stripped
+
+        if not xml_body:
+            continue
+
+        result = dataset_from_xml(
+            xml_body,
+            dataset_class=dataset_class,
+            bulk_data_uri_handler=bulk_data_uri_handler,
+        )
+        datasets_out.append(result)
+
+    return datasets_out
+
+
+def extract_boundary(content_type: str) -> str:
+    """Extract the boundary parameter from a multipart Content-Type header.
+
+    Args:
+        content_type: The Content-Type header value,
+            e.g. ``'multipart/related; type="application/dicom+xml"; boundary=my-boundary'``
+
+    Returns:
+        The boundary string.
+
+    Raises:
+        ValueError: If no boundary parameter is found.
+
+    """
+    for param in content_type.split(";"):
+        param = param.strip()
+        if "=" in param:
+            key, _, value = param.partition("=")
+            if key.strip().lower() == "boundary":
+                return value.strip().strip('"')
+    msg = f"No boundary parameter in Content-Type: {content_type}"
+    raise ValueError(msg)
