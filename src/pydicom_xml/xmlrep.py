@@ -872,6 +872,11 @@ _BCHARS = _BCHARS_NO_SPACE | {" "}
 # Maximum boundary length per RFC 2046 is 70 characters.
 _MAX_BOUNDARY_LENGTH = 70
 
+# RFC 2045 Section 5.1: tspecials that require a parameter value to be quoted.
+# tspecials := "(" / ")" / "<" / ">" / "@" / "," / ";" / ":" / "\" /
+#              <"> / "/" / "[" / "]" / "?" / "=" / SPACE
+_TSPECIALS = frozenset('()<>@,;:\\"/[]?= ')
+
 
 def _validate_boundary(boundary: str) -> None:
     """Validate that a boundary string conforms to RFC 2046 Section 5.1.1.
@@ -892,7 +897,8 @@ def _validate_boundary(boundary: str) -> None:
         raise ValueError(msg)
     invalid_chars = set(boundary) - _BCHARS
     if invalid_chars:
-        msg = f"Boundary contains invalid characters: {sorted(invalid_chars)}"
+        char_reprs = ", ".join(repr(c) for c in sorted(invalid_chars))
+        msg = f"Boundary contains invalid characters: {char_reprs}"
         raise ValueError(msg)
     if boundary.endswith(" "):
         msg = "Boundary must not end with a space (RFC 2046 Section 5.1.1)"
@@ -907,11 +913,7 @@ def _quote_boundary(boundary: str) -> str:
     contains spaces (which are legal bchars but not legal token characters).
 
     """
-    # RFC 2045 token chars: any CHAR except SPACE, CTLs, or tspecials
-    # tspecials: ()<>@,;:\"/[]?=
-    # If boundary contains any non-token char, quote it.
-    tspecials = set('()<>@,;:\\"/[]?= ')
-    if tspecials & set(boundary):
+    if _TSPECIALS & set(boundary):
         return f'"{boundary}"'
     return boundary
 
@@ -985,17 +987,18 @@ def _check_part_content_type(header_block: bytes) -> None:
 
     """
     content_type_value: str | None = None
-    for line in header_block.split(b"\r\n"):
-        if not line:
-            # Also handle LF-only headers
+    # Normalize line endings: replace CRLF with LF, then split on LF
+    lines = header_block.replace(b"\r\n", b"\n").split(b"\n")
+    for line in lines:
+        stripped_line = line.strip()
+        if not stripped_line:
             continue
-        # Handle LF-only line splits within the header block
-        for subline in line.split(b"\n"):
-            if subline.lower().startswith(b"content-type"):
-                _, _, ct_value = subline.partition(b":")
-                content_type_value = ct_value.strip().decode("ascii", errors="replace")
-                break
-        if content_type_value is not None:
+        # Match exactly "content-type:" (case-insensitive) to avoid
+        # false matches on headers that merely start with the same prefix.
+        lower_line = stripped_line.lower()
+        if lower_line.startswith(b"content-type:"):
+            _, _, ct_value = stripped_line.partition(b":")
+            content_type_value = ct_value.strip().decode("ascii", errors="replace")
             break
 
     if content_type_value is None:

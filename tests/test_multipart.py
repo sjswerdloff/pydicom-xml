@@ -163,6 +163,14 @@ class TestValidateBoundary:
     def test_valid_with_space_not_trailing(self):
         _validate_boundary("boundary with space")
 
+    def test_leading_space_accepted(self):
+        _validate_boundary(" boundary")
+
+    def test_single_space_rejected_trailing(self):
+        # A single space is a trailing space
+        with pytest.raises(ValueError, match="must not end with a space"):
+            _validate_boundary(" ")
+
     def test_empty_raises(self):
         with pytest.raises(ValueError, match="must not be empty"):
             _validate_boundary("")
@@ -175,7 +183,7 @@ class TestValidateBoundary:
         _validate_boundary("x" * 70)
 
     def test_invalid_chars_raises(self):
-        with pytest.raises(ValueError, match="invalid characters"):
+        with pytest.raises(ValueError, match=r"invalid characters.*'@'"):
             _validate_boundary("boundary@invalid")
 
     def test_trailing_space_raises(self):
