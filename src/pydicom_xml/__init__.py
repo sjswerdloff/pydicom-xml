@@ -21,6 +21,9 @@ from pydicom_xml.xmlrep import (
     data_element_to_xml_element,
     dataset_from_xml,
     dataset_to_xml,
+    datasets_from_multipart_xml,
+    datasets_to_multipart_xml,
+    extract_boundary,
 )
 
 # Convenience aliases matching pydicom's Dataset method naming
@@ -40,6 +43,9 @@ __all__ = [
     "data_element_to_xml_element",
     "dataset_from_xml",
     "dataset_to_xml",
+    "datasets_from_multipart_xml",
+    "datasets_to_multipart_xml",
+    "extract_boundary",
     "from_xml",
     "to_xml",
 ]
