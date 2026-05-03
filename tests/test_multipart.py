@@ -132,6 +132,18 @@ class TestExtractBoundary:
         ct = 'multipart/related; boundary=first-param; type="application/dicom+xml"'
         assert extract_boundary(ct) == "first-param"
 
+    def test_case_insensitive(self):
+        ct = 'multipart/related; type="application/dicom+xml"; Boundary=my-boundary'
+        assert extract_boundary(ct) == "my-boundary"
+
+    def test_uppercase(self):
+        ct = "multipart/related; BOUNDARY=my-boundary"
+        assert extract_boundary(ct) == "my-boundary"
+
+    def test_whitespace_around_equals(self):
+        ct = "multipart/related; boundary = my-boundary"
+        assert extract_boundary(ct) == "my-boundary"
+
     def test_no_boundary_raises(self):
         ct = 'multipart/related; type="application/dicom+xml"'
         with pytest.raises(ValueError, match="No boundary parameter"):

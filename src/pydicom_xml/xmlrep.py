@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import io
+import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from inspect import signature
@@ -859,7 +860,10 @@ def dataset_from_xml(
 # Multipart XML utilities for DICOMWeb (PS3.18)
 # ---------------------------------------------------------------------------
 
-_DEFAULT_BOUNDARY = "pydicom-xml-boundary"
+
+def _generate_boundary() -> str:
+    """Generate a unique MIME boundary string."""
+    return f"pydicom-xml-{uuid.uuid4().hex}"
 
 
 def datasets_to_multipart_xml(
@@ -886,7 +890,7 @@ def datasets_to_multipart_xml(
 
     """
     if boundary is None:
-        boundary = _DEFAULT_BOUNDARY
+        boundary = _generate_boundary()
 
     if not datasets:
         content_type = f'multipart/related; type="application/dicom+xml"; boundary={boundary}'
@@ -977,8 +981,9 @@ def extract_boundary(content_type: str) -> str:
     """
     for param in content_type.split(";"):
         param = param.strip()
-        if param.startswith("boundary="):
-            value = param[len("boundary=") :]
-            return value.strip('"')
+        if "=" in param:
+            key, _, value = param.partition("=")
+            if key.strip().lower() == "boundary":
+                return value.strip().strip('"')
     msg = f"No boundary parameter in Content-Type: {content_type}"
     raise ValueError(msg)
