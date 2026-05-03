@@ -10,6 +10,13 @@ conventions (``Dataset.to_json`` / ``Dataset.from_json``).
 
 from pydicom_xml.xmlrep import (
     NAMESPACE,
+    DicomXmlAtValueHexError,
+    DicomXmlAtValueLengthError,
+    DicomXmlError,
+    DicomXmlParseError,
+    DicomXmlRootError,
+    DicomXmlTagHexError,
+    DicomXmlTagLengthError,
     XmlDataElementConverter,
     data_element_to_xml_element,
     dataset_from_xml,
@@ -22,6 +29,13 @@ from_xml = dataset_from_xml
 
 __all__ = [
     "NAMESPACE",
+    "DicomXmlAtValueHexError",
+    "DicomXmlAtValueLengthError",
+    "DicomXmlError",
+    "DicomXmlParseError",
+    "DicomXmlRootError",
+    "DicomXmlTagHexError",
+    "DicomXmlTagLengthError",
     "XmlDataElementConverter",
     "data_element_to_xml_element",
     "dataset_from_xml",
