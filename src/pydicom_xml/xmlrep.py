@@ -860,6 +860,61 @@ def dataset_from_xml(
 # Multipart XML utilities for DICOMWeb (PS3.18)
 # ---------------------------------------------------------------------------
 
+# RFC 2046 Section 5.1.1: boundary characters that do NOT require quoting.
+# bcharsnospace := DIGIT / ALPHA / "'" / "(" / ")" / "+" / "_" / "," /
+#                  "-" / "." / "/" / ":" / "=" / "?"
+# bchars := bcharsnospace / " "
+# A boundary value that contains ONLY these characters (excluding trailing
+# spaces) does not need to be quoted in the Content-Type header.
+_BCHARS_NO_SPACE = frozenset("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'()+_,-./:=?")
+_BCHARS = _BCHARS_NO_SPACE | {" "}
+
+# Maximum boundary length per RFC 2046 is 70 characters.
+_MAX_BOUNDARY_LENGTH = 70
+
+
+def _validate_boundary(boundary: str) -> None:
+    """Validate that a boundary string conforms to RFC 2046 Section 5.1.1.
+
+    Args:
+        boundary: The MIME boundary string to validate.
+
+    Raises:
+        ValueError: If the boundary is empty, too long, contains invalid
+            characters, or ends with a space.
+
+    """
+    if not boundary:
+        msg = "Boundary must not be empty"
+        raise ValueError(msg)
+    if len(boundary) > _MAX_BOUNDARY_LENGTH:
+        msg = f"Boundary exceeds maximum length of {_MAX_BOUNDARY_LENGTH}: {len(boundary)}"
+        raise ValueError(msg)
+    invalid_chars = set(boundary) - _BCHARS
+    if invalid_chars:
+        msg = f"Boundary contains invalid characters: {sorted(invalid_chars)}"
+        raise ValueError(msg)
+    if boundary.endswith(" "):
+        msg = "Boundary must not end with a space (RFC 2046 Section 5.1.1)"
+        raise ValueError(msg)
+
+
+def _quote_boundary(boundary: str) -> str:
+    """Quote a boundary for use in a Content-Type header if needed.
+
+    Per RFC 2045 Section 5.1, parameter values containing characters outside
+    the token character set must be quoted.  We always quote if the boundary
+    contains spaces (which are legal bchars but not legal token characters).
+
+    """
+    # RFC 2045 token chars: any CHAR except SPACE, CTLs, or tspecials
+    # tspecials: ()<>@,;:\"/[]?=
+    # If boundary contains any non-token char, quote it.
+    tspecials = set('()<>@,;:\\"/[]?= ')
+    if tspecials & set(boundary):
+        return f'"{boundary}"'
+    return boundary
+
 
 def _generate_boundary() -> str:
     """Generate a unique MIME boundary string."""
@@ -891,9 +946,13 @@ def datasets_to_multipart_xml(
     """
     if boundary is None:
         boundary = _generate_boundary()
+    else:
+        _validate_boundary(boundary)
+
+    quoted = _quote_boundary(boundary)
 
     if not datasets:
-        content_type = f'multipart/related; type="application/dicom+xml"; boundary={boundary}'
+        content_type = f'multipart/related; type="application/dicom+xml"; boundary={quoted}'
         return f"--{boundary}--\r\n".encode(), content_type
 
     parts: list[bytes] = []
@@ -907,8 +966,53 @@ def datasets_to_multipart_xml(
         parts.append(part_header + xml_bytes + b"\r\n")
 
     body = b"".join(parts) + f"--{boundary}--\r\n".encode()
-    content_type = f'multipart/related; type="application/dicom+xml"; boundary={boundary}'
+    content_type = f'multipart/related; type="application/dicom+xml"; boundary={quoted}'
     return body, content_type
+
+
+def _check_part_content_type(header_block: bytes) -> None:
+    """Validate that a multipart part has an acceptable Content-Type.
+
+    Acceptable types are ``application/dicom+xml`` or any ``text/xml`` /
+    ``application/xml`` variant.  If the Content-Type header is absent,
+    the part is accepted (permissive fallback for interoperability).
+
+    Args:
+        header_block: The raw header bytes from the multipart part.
+
+    Raises:
+        ValueError: If the Content-Type is present but not XML-compatible.
+
+    """
+    content_type_value: str | None = None
+    for line in header_block.split(b"\r\n"):
+        if not line:
+            # Also handle LF-only headers
+            continue
+        # Handle LF-only line splits within the header block
+        for subline in line.split(b"\n"):
+            if subline.lower().startswith(b"content-type"):
+                _, _, ct_value = subline.partition(b":")
+                content_type_value = ct_value.strip().decode("ascii", errors="replace")
+                break
+        if content_type_value is not None:
+            break
+
+    if content_type_value is None:
+        # No Content-Type header — permissive: accept and attempt parse
+        return
+
+    # Normalize: take only the media type (ignore parameters like charset)
+    media_type = content_type_value.split(";")[0].strip().lower()
+
+    acceptable_types = {
+        "application/dicom+xml",
+        "text/xml",
+        "application/xml",
+    }
+    if media_type not in acceptable_types:
+        msg = f"Unexpected Content-Type in multipart part: '{content_type_value}'. Expected one of: {sorted(acceptable_types)}"
+        raise ValueError(msg)
 
 
 def datasets_from_multipart_xml(
@@ -946,14 +1050,22 @@ def datasets_from_multipart_xml(
 
         # Split headers from body on double CRLF
         if b"\r\n\r\n" in stripped:
-            xml_body = stripped.split(b"\r\n\r\n", 1)[1].strip()
+            header_block, xml_body = stripped.split(b"\r\n\r\n", 1)
+            xml_body = xml_body.strip()
         elif b"\n\n" in stripped:
-            xml_body = stripped.split(b"\n\n", 1)[1].strip()
+            header_block, xml_body = stripped.split(b"\n\n", 1)
+            xml_body = xml_body.strip()
         else:
+            # No headers present — treat entire content as XML body
+            header_block = b""
             xml_body = stripped
 
         if not xml_body:
             continue
+
+        # Validate per-part Content-Type if headers are present
+        if header_block:
+            _check_part_content_type(header_block)
 
         result = dataset_from_xml(
             xml_body,
