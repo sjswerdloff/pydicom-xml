@@ -16,6 +16,8 @@ import io
 import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
+from email import policy
+from email.parser import BytesHeaderParser
 from inspect import signature
 from typing import TYPE_CHECKING, Any
 
@@ -889,6 +891,9 @@ _ACCEPTABLE_XML_MEDIA_TYPES = frozenset(
     }
 )
 
+# Reusable header parser for multipart part Content-Type validation.
+_HEADER_PARSER = BytesHeaderParser(policy=policy.default)
+
 
 def _validate_boundary(boundary: str) -> None:
     """Validate that a boundary string conforms to RFC 2046 Section 5.1.1.
@@ -991,6 +996,9 @@ def _check_part_content_type(header_block: bytes) -> None:
     ``application/xml`` variant.  If the Content-Type header is absent,
     the part is accepted (permissive fallback for interoperability).
 
+    Uses :class:`email.parser.BytesHeaderParser` to handle RFC 2822 header
+    unfolding and case-insensitive lookup correctly.
+
     Args:
         header_block: The raw header bytes from the multipart part.
 
@@ -1001,31 +1009,14 @@ def _check_part_content_type(header_block: bytes) -> None:
     if not header_block:
         return
 
-    # Normalize line endings and unfold continuation lines (RFC 2822 §2.2.3:
-    # a line starting with whitespace is a continuation of the previous line).
-    normalized = header_block.replace(b"\r\n", b"\n")
-    # Join continuation lines: replace "\n<SP/TAB>" with a single space
-    unfolded = b""
-    for i, line in enumerate(normalized.split(b"\n")):
-        if i > 0 and line and line[0:1] in (b" ", b"\t"):
-            # Continuation line — append to previous
-            unfolded += b" " + line.strip()
-        else:
-            if i > 0:
-                unfolded += b"\n"
-            unfolded += line
+    # BytesHeaderParser expects headers terminated by a blank line.
+    if not header_block.endswith(b"\r\n\r\n"):
+        header_bytes = header_block + b"\r\n\r\n"
+    else:
+        header_bytes = header_block
 
-    content_type_value: str | None = None
-    for line in unfolded.split(b"\n"):
-        stripped_line = line.strip()
-        if not stripped_line:
-            continue
-        # Match exactly "content-type:" (case-insensitive) to avoid
-        # false matches on headers that merely start with the same prefix.
-        if stripped_line.lower().startswith(b"content-type:"):
-            _, _, ct_value = stripped_line.partition(b":")
-            content_type_value = ct_value.strip().decode("ascii", errors="replace")
-            break
+    msg = _HEADER_PARSER.parsebytes(header_bytes)
+    content_type_value = msg.get("Content-Type")
 
     if content_type_value is None:
         # No Content-Type header — permissive: accept and attempt parse
@@ -1035,11 +1026,9 @@ def _check_part_content_type(header_block: bytes) -> None:
     media_type = content_type_value.split(";")[0].strip().lower()
 
     if media_type not in _ACCEPTABLE_XML_MEDIA_TYPES:
-        msg = (
-            f"Unexpected Content-Type in multipart part: '{content_type_value}'. "
-            f"Expected one of: {sorted(_ACCEPTABLE_XML_MEDIA_TYPES)}"
-        )
-        raise ValueError(msg)
+        allowed = ", ".join(sorted(_ACCEPTABLE_XML_MEDIA_TYPES))
+        err_msg = f"Unexpected Content-Type in multipart part: '{content_type_value}'. Expected one of: {allowed}"
+        raise ValueError(err_msg)
 
 
 def datasets_from_multipart_xml(
