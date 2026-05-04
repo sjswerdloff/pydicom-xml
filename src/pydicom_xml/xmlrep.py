@@ -891,12 +891,20 @@ _ACCEPTABLE_XML_MEDIA_TYPES = frozenset(
     }
 )
 
-# Reusable header parser for multipart part Content-Type validation.
-_HEADER_PARSER = BytesHeaderParser(policy=policy.default)
-
 
 def _validate_boundary(boundary: str) -> None:
     """Validate that a boundary string conforms to RFC 2046 Section 5.1.1.
+
+    If the boundary is surrounded by double quotes (as it might appear when
+    extracted directly from a Content-Type header parameter value), the
+    quotes are stripped before validation.
+
+    Each failure mode raises a distinct ``ValueError`` with a specific
+    diagnostic message rather than collapsing all checks into a single regex.
+    When debugging DICOM interoperability issues between systems from
+    different vendors, knowing *which* constraint was violated (invalid
+    character, length, trailing space) is far more actionable than a
+    generic "boundary invalid" error.
 
     Args:
         boundary: The MIME boundary string to validate.
@@ -906,6 +914,10 @@ def _validate_boundary(boundary: str) -> None:
             characters, or ends with a space.
 
     """
+    # Strip surrounding quotes defensively — callers may pass the raw
+    # header parameter value which includes quotes per RFC 2045.
+    if len(boundary) >= 2 and boundary.startswith('"') and boundary.endswith('"'):
+        boundary = boundary[1:-1]
     if not boundary:
         msg = "Boundary must not be empty"
         raise ValueError(msg)
@@ -1015,7 +1027,8 @@ def _check_part_content_type(header_block: bytes) -> None:
     else:
         header_bytes = header_block
 
-    msg = _HEADER_PARSER.parsebytes(header_bytes)
+    parser = BytesHeaderParser(policy=policy.default)
+    msg = parser.parsebytes(header_bytes)
     content_type_value = msg.get("Content-Type")
 
     if content_type_value is None:
@@ -1064,17 +1077,15 @@ def datasets_from_multipart_xml(
         if not stripped or stripped == b"--" or stripped.startswith(b"--"):
             continue
 
-        # Split headers from body on double CRLF
-        if b"\r\n\r\n" in stripped:
-            header_block, xml_body = stripped.split(b"\r\n\r\n", 1)
-            xml_body = xml_body.strip()
-        elif b"\n\n" in stripped:
-            header_block, xml_body = stripped.split(b"\n\n", 1)
+        # Normalize line endings then split headers from body on blank line
+        normalized = stripped.replace(b"\r\n", b"\n")
+        if b"\n\n" in normalized:
+            header_block, xml_body = normalized.split(b"\n\n", 1)
             xml_body = xml_body.strip()
         else:
             # No headers present — treat entire content as XML body
             header_block = b""
-            xml_body = stripped
+            xml_body = normalized
 
         if not xml_body:
             continue
