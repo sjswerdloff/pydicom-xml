@@ -892,12 +892,13 @@ _ACCEPTABLE_XML_MEDIA_TYPES = frozenset(
 )
 
 
-def _validate_boundary(boundary: str) -> None:
-    """Validate that a boundary string conforms to RFC 2046 Section 5.1.1.
+def _validate_boundary(boundary: str) -> str:
+    """Validate and normalize a boundary string per RFC 2046 Section 5.1.1.
 
     If the boundary is surrounded by double quotes (as it might appear when
     extracted directly from a Content-Type header parameter value), the
-    quotes are stripped before validation.
+    quotes are stripped.  The normalized (unquoted) boundary is returned
+    so callers can use it directly for MIME delimiter matching.
 
     Each failure mode raises a distinct ``ValueError`` with a specific
     diagnostic message rather than collapsing all checks into a single regex.
@@ -908,6 +909,9 @@ def _validate_boundary(boundary: str) -> None:
 
     Args:
         boundary: The MIME boundary string to validate.
+
+    Returns:
+        The normalized (unquoted) boundary string.
 
     Raises:
         ValueError: If the boundary is empty, too long, contains invalid
@@ -932,6 +936,7 @@ def _validate_boundary(boundary: str) -> None:
     if boundary.endswith(" "):
         msg = "Boundary must not end with a space (RFC 2046 Section 5.1.1)"
         raise ValueError(msg)
+    return boundary
 
 
 def _quote_boundary(boundary: str) -> str:
@@ -978,7 +983,7 @@ def datasets_to_multipart_xml(
     if boundary is None:
         boundary = _generate_boundary()
     else:
-        _validate_boundary(boundary)
+        boundary = _validate_boundary(boundary)
 
     quoted = _quote_boundary(boundary)
 
@@ -1066,7 +1071,7 @@ def datasets_from_multipart_xml(
         List of pydicom Datasets, one per multipart part.
 
     """
-    _validate_boundary(boundary)
+    boundary = _validate_boundary(boundary)
     boundary_bytes = f"--{boundary}".encode()
 
     # Split on boundary markers

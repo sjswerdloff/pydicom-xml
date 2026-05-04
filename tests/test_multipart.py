@@ -171,8 +171,13 @@ class TestValidateBoundary:
         with pytest.raises(ValueError, match="must not end with a space"):
             _validate_boundary(" ")
 
-    def test_quoted_boundary_stripped_and_validated(self):
-        _validate_boundary('"simple-boundary"')
+    def test_quoted_boundary_stripped_and_returned(self):
+        result = _validate_boundary('"simple-boundary"')
+        assert result == "simple-boundary"
+
+    def test_unquoted_boundary_returned_as_is(self):
+        result = _validate_boundary("normal-boundary")
+        assert result == "normal-boundary"
 
     def test_quoted_boundary_with_invalid_chars_raises(self):
         with pytest.raises(ValueError, match=r"invalid characters"):
