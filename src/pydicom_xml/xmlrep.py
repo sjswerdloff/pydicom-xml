@@ -1022,8 +1022,9 @@ def _check_part_content_type(header_block: bytes) -> None:
         return
 
     # BytesHeaderParser expects headers terminated by a blank line.
-    if not header_block.endswith(b"\r\n\r\n"):
-        header_bytes = header_block + b"\r\n\r\n"
+    # The caller normalizes line endings to LF, so use LF-only here too.
+    if not header_block.endswith(b"\n\n"):
+        header_bytes = header_block + b"\n\n"
     else:
         header_bytes = header_block
 
@@ -1065,6 +1066,7 @@ def datasets_from_multipart_xml(
         List of pydicom Datasets, one per multipart part.
 
     """
+    _validate_boundary(boundary)
     boundary_bytes = f"--{boundary}".encode()
 
     # Split on boundary markers
