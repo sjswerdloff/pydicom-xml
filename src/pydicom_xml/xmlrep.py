@@ -16,6 +16,8 @@ import io
 import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
+from email import policy
+from email.parser import BytesHeaderParser
 from inspect import signature
 from typing import TYPE_CHECKING, Any
 
@@ -860,6 +862,95 @@ def dataset_from_xml(
 # Multipart XML utilities for DICOMWeb (PS3.18)
 # ---------------------------------------------------------------------------
 
+# RFC 2046 Section 5.1.1: boundary characters that do NOT require quoting.
+# bcharsnospace := DIGIT / ALPHA / "'" / "(" / ")" / "+" / "_" / "," /
+#                  "-" / "." / "/" / ":" / "=" / "?"
+# bchars := bcharsnospace / " "
+# A boundary value that contains ONLY these characters (excluding trailing
+# spaces) does not need to be quoted in the Content-Type header.
+_BCHARS_NO_SPACE = frozenset("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'()+_,-./:=?")
+_BCHARS = _BCHARS_NO_SPACE | {" "}
+
+# Maximum boundary length per RFC 2046 is 70 characters.
+_MAX_BOUNDARY_LENGTH = 70
+
+# RFC 2045 Section 5.1: tspecials that require a parameter value to be quoted.
+# tspecials := "(" / ")" / "<" / ">" / "@" / "," / ";" / ":" / "\" /
+#              <"> / "/" / "[" / "]" / "?" / "=" / SPACE
+_TSPECIALS = frozenset('()<>@,;:\\"/[]?= ')
+
+# Acceptable MIME media types for parts in a DICOMWeb multipart/related response.
+# application/dicom+xml is the canonical type (PS3.18).  text/xml and
+# application/xml are accepted for interoperability with conformant but
+# loosely-typed servers.
+_ACCEPTABLE_XML_MEDIA_TYPES = frozenset(
+    {
+        "application/dicom+xml",
+        "text/xml",
+        "application/xml",
+    }
+)
+
+
+def _validate_boundary(boundary: str) -> str:
+    """Validate and normalize a boundary string per RFC 2046 Section 5.1.1.
+
+    If the boundary is surrounded by double quotes (as it might appear when
+    extracted directly from a Content-Type header parameter value), the
+    quotes are stripped.  The normalized (unquoted) boundary is returned
+    so callers can use it directly for MIME delimiter matching.
+
+    Each failure mode raises a distinct ``ValueError`` with a specific
+    diagnostic message rather than collapsing all checks into a single regex.
+    When debugging DICOM interoperability issues between systems from
+    different vendors, knowing *which* constraint was violated (invalid
+    character, length, trailing space) is far more actionable than a
+    generic "boundary invalid" error.
+
+    Args:
+        boundary: The MIME boundary string to validate.
+
+    Returns:
+        The normalized (unquoted) boundary string.
+
+    Raises:
+        ValueError: If the boundary is empty, too long, contains invalid
+            characters, or ends with a space.
+
+    """
+    # Strip surrounding quotes defensively — callers may pass the raw
+    # header parameter value which includes quotes per RFC 2045.
+    if len(boundary) >= 2 and boundary.startswith('"') and boundary.endswith('"'):
+        boundary = boundary[1:-1]
+    if not boundary:
+        msg = "Boundary must not be empty"
+        raise ValueError(msg)
+    if len(boundary) > _MAX_BOUNDARY_LENGTH:
+        msg = f"Boundary exceeds maximum length of {_MAX_BOUNDARY_LENGTH}: {len(boundary)}"
+        raise ValueError(msg)
+    invalid_chars = set(boundary) - _BCHARS
+    if invalid_chars:
+        char_reprs = ", ".join(repr(c) for c in sorted(invalid_chars))
+        msg = f"Boundary contains invalid characters: {char_reprs}"
+        raise ValueError(msg)
+    if boundary.endswith(" "):
+        msg = "Boundary must not end with a space (RFC 2046 Section 5.1.1)"
+        raise ValueError(msg)
+    return boundary
+
+
+def _quote_boundary(boundary: str) -> str:
+    """Quote a boundary for use in a Content-Type header if needed.
+
+    Per RFC 2045 Section 5.1, parameter values containing characters outside
+    the token character set must be quoted.  We always quote if the boundary
+    contains spaces (which are legal bchars but not legal token characters).
+
+    """
+    if _TSPECIALS & set(boundary):
+        return f'"{boundary}"'
+    return boundary
+
 
 def _generate_boundary() -> str:
     """Generate a unique MIME boundary string."""
@@ -891,9 +982,13 @@ def datasets_to_multipart_xml(
     """
     if boundary is None:
         boundary = _generate_boundary()
+    else:
+        boundary = _validate_boundary(boundary)
+
+    quoted = _quote_boundary(boundary)
 
     if not datasets:
-        content_type = f'multipart/related; type="application/dicom+xml"; boundary={boundary}'
+        content_type = f'multipart/related; type="application/dicom+xml"; boundary={quoted}'
         return f"--{boundary}--\r\n".encode(), content_type
 
     parts: list[bytes] = []
@@ -907,8 +1002,52 @@ def datasets_to_multipart_xml(
         parts.append(part_header + xml_bytes + b"\r\n")
 
     body = b"".join(parts) + f"--{boundary}--\r\n".encode()
-    content_type = f'multipart/related; type="application/dicom+xml"; boundary={boundary}'
+    content_type = f'multipart/related; type="application/dicom+xml"; boundary={quoted}'
     return body, content_type
+
+
+def _check_part_content_type(header_block: bytes) -> None:
+    """Validate that a multipart part has an acceptable Content-Type.
+
+    Acceptable types are ``application/dicom+xml`` or any ``text/xml`` /
+    ``application/xml`` variant.  If the Content-Type header is absent,
+    the part is accepted (permissive fallback for interoperability).
+
+    Uses :class:`email.parser.BytesHeaderParser` to handle RFC 2822 header
+    unfolding and case-insensitive lookup correctly.
+
+    Args:
+        header_block: The raw header bytes from the multipart part.
+
+    Raises:
+        ValueError: If the Content-Type is present but not XML-compatible.
+
+    """
+    if not header_block:
+        return
+
+    # BytesHeaderParser expects headers terminated by a blank line.
+    # The caller normalizes line endings to LF, so use LF-only here too.
+    if not header_block.endswith(b"\n\n"):
+        header_bytes = header_block + b"\n\n"
+    else:
+        header_bytes = header_block
+
+    parser = BytesHeaderParser(policy=policy.default)
+    msg = parser.parsebytes(header_bytes)
+    content_type_value = msg.get("Content-Type")
+
+    if content_type_value is None:
+        # No Content-Type header — permissive: accept and attempt parse
+        return
+
+    # Normalize: take only the media type (ignore parameters like charset)
+    media_type = content_type_value.split(";")[0].strip().lower()
+
+    if media_type not in _ACCEPTABLE_XML_MEDIA_TYPES:
+        allowed = ", ".join(sorted(_ACCEPTABLE_XML_MEDIA_TYPES))
+        err_msg = f"Unexpected Content-Type in multipart part: '{content_type_value}'. Expected one of: {allowed}"
+        raise ValueError(err_msg)
 
 
 def datasets_from_multipart_xml(
@@ -932,6 +1071,7 @@ def datasets_from_multipart_xml(
         List of pydicom Datasets, one per multipart part.
 
     """
+    boundary = _validate_boundary(boundary)
     boundary_bytes = f"--{boundary}".encode()
 
     # Split on boundary markers
@@ -944,16 +1084,21 @@ def datasets_from_multipart_xml(
         if not stripped or stripped == b"--" or stripped.startswith(b"--"):
             continue
 
-        # Split headers from body on double CRLF
-        if b"\r\n\r\n" in stripped:
-            xml_body = stripped.split(b"\r\n\r\n", 1)[1].strip()
-        elif b"\n\n" in stripped:
-            xml_body = stripped.split(b"\n\n", 1)[1].strip()
+        # Normalize line endings then split headers from body on blank line
+        normalized = stripped.replace(b"\r\n", b"\n")
+        if b"\n\n" in normalized:
+            header_block, xml_body = normalized.split(b"\n\n", 1)
+            xml_body = xml_body.strip()
         else:
-            xml_body = stripped
+            # No headers present — treat entire content as XML body
+            header_block = b""
+            xml_body = normalized
 
         if not xml_body:
             continue
+
+        # Validate per-part Content-Type
+        _check_part_content_type(header_block)
 
         result = dataset_from_xml(
             xml_body,
